@@ -1,160 +1,146 @@
 #!/usr/bin/env python3
 """
-app.py  —  Railway Block Monitor  |  Raspberry Pi
-=======================================================
-- Reads serial data from Nano1 (/dev/ttyUSB0) and
-  Nano2 (/dev/ttyUSB1) in background threads
-- Maintains live block states (OCC / CLR)
-- Serves the animated web dashboard via Flask
-- Pushes real-time updates to browser via SocketIO
+app.py  —  Railway Block Monitor
+Run from the folder that also contains  templates/index.html
 
-Run:
-    pip install flask flask-socketio pyserial eventlet
     python3 app.py
 
-Then open browser on RPi (or any device on same network):
-    http://<raspberry-pi-ip>:5000
-    or  http://localhost:5000  on the RPi itself
-=======================================================
+Then open:  http://localhost:5000
 """
 
-import threading
-import logging
-import time
-import serial
-import serial.tools.list_ports
+import os, sys, threading, time, logging
+import serial, serial.tools.list_ports
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
 
-# ── Logging ──────────────────────────────────────────────────────
+# ── logging ───────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S"
 )
 log = logging.getLogger(__name__)
 
-# ── Flask / SocketIO ──────────────────────────────────────────────
-app    = Flask(__name__)
-app.config["SECRET_KEY"] = "rly-mon-2024"
-sio    = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# ── Flask — look for templates/ NEXT TO this script ───────────────
+BASE = os.path.dirname(os.path.abspath(__file__))
+app  = Flask(__name__, template_folder=os.path.join(BASE, "templates"))
+app.config["SECRET_KEY"] = "railway-2024"
+sio  = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# ── Block state (True = Occupied / RED, False = Clear / GREEN) ────
-# B1..B4  from Nano1,  B5..B11 from Nano2
+# ── Block state  (True = OCCUPIED/RED,  False = CLEAR/GREEN) ──────
 BLOCKS = {f"B{i}": False for i in range(1, 12)}
-
-# Which nano owns which blocks
-NANO_BLOCKS = {
-    "1": ["B1","B2","B3","B4"],
-    "2": ["B5","B6","B7","B8","B9","B10","B11"],
-}
-
-# Serial ports — Nano1 on USB0, Nano2 on USB1
-SERIAL_PORTS = {
-    "1": "/dev/ttyUSB0",
-    "2": "/dev/ttyUSB1",
-}
-BAUD = 9600
-
-# Lock for thread-safe block state writes
 state_lock = threading.Lock()
 
-# ── Route ─────────────────────────────────────────────────────────
+# ── Serial port config ─────────────────────────────────────────────
+# Change these if your ports are different
+PORT_NANO1 = "/dev/ttyUSB0"
+PORT_NANO2 = "/dev/ttyUSB1"
+BAUD       = 9600
+
+# ── Routes ────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
 
-# ── SocketIO events ───────────────────────────────────────────────
+# ── SocketIO ──────────────────────────────────────────────────────
 @sio.on("connect")
 def on_connect():
     log.info("Browser connected")
-    emit("state", _snapshot())
+    emit("state", _snap())
 
 @sio.on("request_state")
-def on_request():
-    emit("state", _snapshot())
+def on_req():
+    emit("state", _snap())
 
-def _snapshot():
+def _snap():
     with state_lock:
         return dict(BLOCKS)
 
-def _broadcast():
-    sio.emit("state", _snapshot())
+def _push():
+    sio.emit("state", _snap())
 
 # ── Serial reader ─────────────────────────────────────────────────
-def serial_reader(nano_id: str, port: str):
+def reader(port, nano_label):
     """
-    Connects to one Arduino Nano and reads lines forever.
-    Reconnects automatically if the port drops.
-    Message format:  <nano_id>:<block_id>:<OCC|CLR>
-    Example:         1:B3:OCC
+    Reads one serial port forever, reconnects on error.
+    Expected message format:   N1:B3:OCC\r\n
     """
     while True:
         try:
-            log.info(f"Nano{nano_id}: connecting on {port}")
-            ser = serial.Serial(port, BAUD, timeout=2)
-            time.sleep(2)          # let Arduino reset
-            ser.reset_input_buffer()
-            log.info(f"Nano{nano_id}: connected")
+            log.info(f"{nano_label}: opening {port}")
+            with serial.Serial(port, BAUD, timeout=2) as ser:
+                time.sleep(2)                  # let Arduino boot/reset
+                ser.reset_input_buffer()
+                log.info(f"{nano_label}: port open — waiting for data")
 
-            while True:
-                if ser.in_waiting:
-                    raw = ser.readline().decode("utf-8", errors="ignore").strip()
-                    if raw:
-                        _process(raw, nano_id)
-                else:
-                    time.sleep(0.005)
+                while True:
+                    raw = ser.readline()       # bytes, ends with \n
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line:
+                        log.info(f"{nano_label} RX: {line!r}")
+                        parse(line, nano_label)
 
         except serial.SerialException as e:
-            log.error(f"Nano{nano_id} serial error: {e}  — retrying in 5s")
+            log.error(f"{nano_label}: serial error — {e}  (retry in 5s)")
             time.sleep(5)
         except Exception as e:
-            log.error(f"Nano{nano_id} unexpected error: {e}")
+            log.error(f"{nano_label}: unexpected error — {e}")
             time.sleep(5)
 
-def _process(raw: str, nano_id: str):
-    """Parse one serial line and update block state."""
-    # ignore READY handshake
-    if raw.endswith(":READY"):
-        log.info(f"Nano{nano_id} is online (READY)")
-        return
-
-    parts = raw.split(":")
+def parse(line, src):
+    """
+    Accept:  N1:B3:OCC  /  N1:B3:CLR  /  N2:B10:OCC  etc.
+    Also ignores READY messages.
+    """
+    parts = line.split(":")
     if len(parts) != 3:
-        log.debug(f"Nano{nano_id} bad message: {raw!r}")
         return
 
     _, block, state = parts
     block = block.strip().upper()
     state = state.strip().upper()
 
+    if state == "OK":          # READY:OK — just a handshake
+        log.info(f"{src} is online")
+        _push()                # refresh browser pills
+        return
+
     if block not in BLOCKS:
-        log.debug(f"Unknown block: {block}")
+        log.warning(f"Unknown block: {block!r}")
         return
     if state not in ("OCC", "CLR"):
-        log.debug(f"Unknown state: {state}")
+        log.warning(f"Unknown state: {state!r}")
         return
 
     occupied = (state == "OCC")
-
     with state_lock:
         changed = BLOCKS[block] != occupied
         BLOCKS[block] = occupied
 
     if changed:
         log.info(f"Block {block} → {'OCCUPIED' if occupied else 'CLEAR'}")
-        _broadcast()
+        _push()
 
-# ── Main ──────────────────────────────────────────────────────────
+# ── Check templates folder exists ─────────────────────────────────
+tpl = os.path.join(BASE, "templates", "index.html")
+if not os.path.exists(tpl):
+    log.error(f"MISSING FILE: {tpl}")
+    log.error("Make sure templates/index.html is in the same folder as app.py")
+    sys.exit(1)
+
+# ── Start serial threads ──────────────────────────────────────────
+threading.Thread(target=reader, args=(PORT_NANO1, "NANO1"), daemon=True).start()
+threading.Thread(target=reader, args=(PORT_NANO2, "NANO2"), daemon=True).start()
+
+# ── Run ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Start one reader thread per Nano
-    for nano_id, port in SERIAL_PORTS.items():
-        t = threading.Thread(
-            target=serial_reader,
-            args=(nano_id, port),
-            daemon=True,
-            name=f"nano{nano_id}-reader"
-        )
-        t.start()
-
-    log.info("Starting Flask server on http://0.0.0.0:5000")
+    log.info("="*50)
+    log.info("Railway Block Monitor starting")
+    log.info(f"Templates folder : {BASE}/templates/")
+    log.info(f"Nano1 port       : {PORT_NANO1}")
+    log.info(f"Nano2 port       : {PORT_NANO2}")
+    log.info("Open browser at  : http://localhost:5000")
+    log.info("="*50)
     sio.run(app, host="0.0.0.0", port=5000, debug=False)
