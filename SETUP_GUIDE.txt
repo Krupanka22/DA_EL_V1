@@ -1,0 +1,179 @@
+=============================================================
+ RAILWAY BLOCK MONITOR — COMPLETE SETUP GUIDE
+=============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. HARDWARE WIRING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POWER (both Nanos):
+  All IR VCC  →  5V rail (can use Nano's 5V pin)
+  All IR GND  →  GND rail (Nano GND)
+  Each IR OUT →  Arduino digital pin (see below)
+
+NANO 1  (ttyUSB0)  — Bottom Track (Line A)
+┌──────────┬─────────────┬──────────┐
+│  Sensor  │  Block      │  Arduino │
+│          │             │  Pin     │
+├──────────┼─────────────┼──────────┤
+│  S1      │  Block 1    │  D2      │
+│  S2      │  Block 2    │  D3      │
+│  S3      │  Block 3    │  D4      │
+│  S4      │  Block 4    │  D5      │
+└──────────┴─────────────┴──────────┘
+
+NANO 2  (ttyUSB1)  — Middle + Top Tracks (Lines B & C)
+┌──────────┬─────────────┬──────────┐
+│  Sensor  │  Block      │  Arduino │
+│          │             │  Pin     │
+├──────────┼─────────────┼──────────┤
+│  S5      │  Block 5    │  D2      │
+│  S6      │  Block 6    │  D3      │
+│  S7      │  Block 7    │  D4      │
+│  S8      │  Block 8    │  D5      │
+│  S9      │  Block 9    │  D6      │
+│  S10     │  Block 10   │  D7      │
+│  S11     │  Block 11   │  D8      │
+└──────────┴─────────────┴──────────┘
+
+IR MODULE NOTES:
+  - IR sensor OUT is ACTIVE LOW (LOW = object present)
+  - The code uses INPUT (no pull-up) since the module
+    has its own pull-up resistor on the output
+  - Sensitivity: adjust the pot on each module until the
+    LED lights when a train passes at operating height
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 2. USB CONNECTION ORDER (IMPORTANT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Plug Nano 1 (S1-S4) into the USB port that becomes /dev/ttyUSB0
+  Plug Nano 2 (S5-S11) into the USB port that becomes /dev/ttyUSB1
+
+  To verify which port is which:
+    ls /dev/ttyUSB*          → shows available ports
+    dmesg | tail -20         → shows last USB events with port names
+
+  If ports are swapped, either swap the cables or edit app.py:
+    SERIAL_PORTS = {
+        "1": "/dev/ttyUSB0",   ← change to ttyUSB1 if needed
+        "2": "/dev/ttyUSB1",   ← change to ttyUSB0 if needed
+    }
+
+  To make port assignment permanent (udev rule):
+    1. Find each Nano's serial ID:
+         udevadm info -a -n /dev/ttyUSB0 | grep ATTRS{serial}
+    2. Create /etc/udev/rules.d/99-railway.rules:
+         SUBSYSTEM=="tty", ATTRS{serial}=="<id_of_nano1>", SYMLINK+="nano1"
+         SUBSYSTEM=="tty", ATTRS{serial}=="<id_of_nano2>", SYMLINK+="nano2"
+    3. Then change app.py to use /dev/nano1 and /dev/nano2
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 3. ARDUINO UPLOAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  a. Install Arduino IDE on any computer
+  b. Open nano1.ino → select Board: Arduino Nano
+     Processor: ATmega328P (Old Bootloader) if clone
+  c. Select the correct COM/ttyUSB port
+  d. Upload
+  e. Repeat for nano2.ino on Nano 2
+  f. Open Serial Monitor (9600 baud) to verify output:
+       1:READY
+       1:B1:OCC
+       1:B1:CLR
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 4. RASPBERRY PI SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # Install Python dependencies
+  pip3 install flask flask-socketio pyserial eventlet
+
+  # Copy files to RPi (folder structure):
+  #   ~/railway/
+  #     app.py
+  #     requirements.txt
+  #     templates/
+  #       index.html
+
+  # Run the server
+  cd ~/railway
+  python3 app.py
+
+  # Open the dashboard
+  # On RPi with TFT display:
+  #   chromium-browser --kiosk http://localhost:5000
+  #
+  # On any device on same WiFi:
+  #   http://<RPi-IP>:5000
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 5. AUTO-START ON BOOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Create /etc/systemd/system/railway.service:
+
+    [Unit]
+    Description=Railway Block Monitor
+    After=network.target
+
+    [Service]
+    ExecStart=/usr/bin/python3 /home/pi/railway/app.py
+    WorkingDirectory=/home/pi/railway
+    Restart=always
+    User=pi
+
+    [Install]
+    WantedBy=multi-user.target
+
+  Then enable:
+    sudo systemctl enable railway
+    sudo systemctl start railway
+
+  Auto-open Chromium in kiosk mode on the TFT:
+  Add to /etc/xdg/autostart/kiosk.desktop:
+
+    [Desktop Entry]
+    Type=Application
+    Name=Railway Kiosk
+    Exec=chromium-browser --kiosk --disable-infobars http://localhost:5000
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 6. DASHBOARD COLOUR GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  GREEN (solid)  =  Block is CLEAR — no train/coach present
+  RED (pulsing)  =  Block is OCCUPIED — train/coach detected
+
+  NANO-1 / NANO-2 pills in top-right:
+    Lit green   =  Arduino connected and sending data
+    Dimmed grey =  Arduino not yet detected or disconnected
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 7. TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Problem: /dev/ttyUSB0 permission denied
+  Fix:     sudo usermod -a -G dialout pi   (then reboot)
+
+  Problem: Block stays RED after train leaves
+  Fix:     Reduce IR sensitivity (pot on module) or
+           increase DEBOUNCE_MS in Arduino sketch
+
+  Problem: Block flickers GREEN/RED rapidly
+  Fix:     Increase DEBOUNCE_MS from 60 to 100 in Arduino
+
+  Problem: Wrong Nano on wrong port
+  Fix:     Swap USB cables or edit SERIAL_PORTS in app.py
+
+  Problem: Browser shows blank page
+  Fix:     Wait ~5s after python3 app.py for server to start,
+           then refresh the page
+=============================================================
